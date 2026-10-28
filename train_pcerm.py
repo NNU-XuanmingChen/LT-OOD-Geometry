@@ -1,5 +1,6 @@
 import argparse
 import json
+import platform
 import time
 from pathlib import Path
 import numpy as np
@@ -78,6 +79,44 @@ def evaluate(backbone, classifier, loader, device):
     return {"overall": correct / max(total, 1), "mean_energy_id": energy_sum / max(total, 1)}
 
 
+def write_training_time(path, device, started_at, epochs, start_epoch):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started_at
+    cpu = platform.processor() or platform.machine()
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        cpu = next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in cpuinfo.read_text().splitlines()
+                if line.startswith("model name")
+            ),
+            cpu,
+        )
+    timing = {
+        "total_seconds": elapsed,
+        "start_epoch": start_epoch,
+        "completed_epochs": epochs - start_epoch,
+        "scope": "training, validation, logs, checkpoint saves",
+        "device": str(device),
+        "cpu": cpu,
+        "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "gpu_memory_bytes": (
+            torch.cuda.get_device_properties(device).total_memory
+            if device.type == "cuda"
+            else None
+        ),
+        "python": platform.python_version(),
+        "torch": str(torch.__version__),
+        "cuda": torch.version.cuda,
+    }
+    if start_epoch == 0 and epochs == 200:
+        timing["cost_seconds_per_epoch"] = elapsed / 200
+    path.write_text(json.dumps(timing, indent=2))
+    return timing
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -126,10 +165,14 @@ def main():
         start_epoch = int(payload.get("epoch", -1)) + 1
         best_acc = float(payload.get("best_acc", 0.0))
         print(json.dumps({"resume_from_epoch": start_epoch - 1, "best_acc": best_acc}), flush=True)
+    if start_epoch >= args.epochs:
+        return
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started_at = time.perf_counter()
     for epoch in range(start_epoch, args.epochs):
         backbone.train()
         classifier.train()
-        epoch_start = time.time()
         loss_sum = 0.0
         correct = 0
         total = 0
@@ -162,7 +205,6 @@ def main():
             "mean_energy_id": val["mean_energy_id"],
             "best_acc": best_acc,
             "lr": scheduler.get_last_lr()[0],
-            "epoch_time": time.time() - epoch_start,
         }
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
@@ -183,6 +225,8 @@ def main():
             torch.save(ckpt, run_dir / f"epoch_{epoch + 1:03d}.pth")
         if val["overall"] >= best_acc:
             torch.save(ckpt, run_dir / "best_model.pth")
+
+    write_training_time(run_dir / "timing.json", device, started_at, args.epochs, start_epoch)
 
 
 if __name__ == "__main__":
